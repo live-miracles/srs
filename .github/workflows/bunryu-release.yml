@@ -1,0 +1,60 @@
+# Build the Bunryu SRS package: upstream v6.0-rN plus the commits on this branch.
+# Push a tag named bunryu-v6.0-rN-M (M counts our builds on that upstream release).
+name: "Bunryu release"
+
+on:
+  push:
+    tags:
+      - bunryu-*
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Same build as upstream's release package (trunk/Dockerfile.pkg): CentOS 7 for glibc 2.17, with the
+      # same options. --sanitizer=off is explicit, because 6.0 enables ASan by default outside CentOS.
+      - name: Build package
+        run: |
+          TAG=${GITHUB_REF_NAME}
+          docker run --rm -v "$PWD:/srs" -w /srs/trunk ossrs/srs:dev bash -c "
+            yum install -y -q zip &&
+            ./scripts/package.sh --x86-x64 --gb28181=on --apm=on --h265=on --sanitizer=off --jobs=$(nproc) --tag=${TAG#bunryu-v}"
+          ZIP=SRS-CentOS7-x86_64-${TAG#bunryu-v}.zip
+          cp trunk/objs/$ZIP .
+          echo "ZIP=$ZIP" >> $GITHUB_ENV
+
+      - name: Check binary
+        run: |
+          rm -rf check && mkdir check && unzip -q "$ZIP" -d check
+          BIN=$(find check -type f -path '*/usr/local/srs/objs/srs')
+          "$BIN" -v
+          if nm -D "$BIN" | grep -q __asan_init || nm "$BIN" 2>/dev/null | grep -q __asan_init; then
+            echo "ERROR: the binary is built with ASan" >&2; exit 1
+          fi
+          objdump -T "$BIN" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1
+          sha256sum "$ZIP" | tee "$ZIP.sha256"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The upstream tags aren't pushed to this fork: pushing one would run upstream's release workflow.
+          git fetch -q --no-tags https://github.com/ossrs/srs.git '+refs/tags/v6.0-r*:refs/tags/v6.0-r*'
+          BASE=$(git describe --tags --abbrev=0 --match 'v6.0-r*' HEAD)
+          {
+            echo "SRS ${BASE} for [Bunryu](https://github.com/live-miracles/bunryu), with these commits on top:"
+            echo
+            git log --reverse --format='- %s (%h)' "${BASE}..HEAD" -- trunk/src trunk/3rdparty trunk/configure trunk/auto
+            echo
+            echo "SHA-256: \`$(cut -d' ' -f1 "$ZIP.sha256")\`"
+          } > notes.md
+          gh release create "$GITHUB_REF_NAME" "$ZIP" "$ZIP.sha256" \
+            --title "$GITHUB_REF_NAME" --notes-file notes.md --repo "$GITHUB_REPOSITORY"
